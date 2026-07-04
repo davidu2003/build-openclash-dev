@@ -7,10 +7,13 @@ on:
 env:
   REPO_URL: https://github.com/vernesong/OpenClash.git
   REPO_BRANCH: dev
-  OPENWRT_VERSION: 25.12.0
+
+  # 软路由 J4125 / N100 / N150 / x86_64 一般用这个
+  OPENWRT_VERSION: 25.12.4
   OPENWRT_TARGET: x86
   OPENWRT_SUBTARGET: 64
   OPENWRT_ARCH: x86_64
+
   TZ: Asia/Shanghai
 
 permissions:
@@ -28,63 +31,114 @@ jobs:
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
-        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-        sudo docker image prune --all --force
+        sudo rm -rf /etc/apt/sources.list.d/* \
+          /usr/share/dotnet \
+          /usr/local/lib/android \
+          /opt/ghc \
+          /opt/hostedtoolcache/CodeQL
+
+        sudo docker image prune --all --force || true
 
         sudo -E apt-get -qq update
         sudo -E apt-get -qq install -y \
-          build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
-          gettext git libncurses5-dev libssl-dev python3-distutils python3-pyelftools \
-          rsync unzip zlib1g-dev file wget curl subversion swig time zstd
+          ack antlr3 asciidoc autoconf automake autopoint \
+          binutils bison build-essential bzip2 ccache cmake cpio curl \
+          device-tree-compiler fastjar flex gawk gettext gcc-multilib \
+          g++-multilib git gperf haveged help2man intltool \
+          libc6-dev-i386 libelf-dev libglib2.0-dev libgmp3-dev \
+          libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev \
+          libncursesw5-dev libpython3-dev libreadline-dev libssl-dev \
+          libtool lrzsz mkisofs msmtp ninja-build p7zip p7zip-full \
+          patch pkgconf python3 python3-pyelftools python3-setuptools \
+          qemu-utils rsync scons squashfs-tools subversion swig \
+          texinfo uglifyjs unzip vim wget xmlto xxd zlib1g-dev zstd file
 
         sudo timedatectl set-timezone "$TZ"
+
         sudo mkdir -p /workdir
         sudo chown $USER:$GROUPS /workdir
 
     - name: Get OpenWrt SDK
       working-directory: /workdir
       run: |
-        SDK_URL="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets/${OPENWRT_TARGET}/${OPENWRT_SUBTARGET}/openwrt-sdk-${OPENWRT_VERSION}-${OPENWRT_TARGET}-${OPENWRT_SUBTARGET}_gcc-14.3.0_musl.Linux-x86_64.tar.zst"
+        SDK_NAME="openwrt-sdk-${OPENWRT_VERSION}-${OPENWRT_TARGET}-${OPENWRT_SUBTARGET}_gcc-14.3.0_musl.Linux-x86_64.tar.zst"
+        SDK_URL="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets/${OPENWRT_TARGET}/${OPENWRT_SUBTARGET}/${SDK_NAME}"
+
+        echo "Downloading SDK:"
+        echo "$SDK_URL"
 
         curl -SLk --connect-timeout 30 --retry 3 "$SDK_URL" -o SDK.tar.zst
+
         tar --zstd -xf SDK.tar.zst
         mv openwrt-sdk-* openwrtsdk
 
-    - name: Clone OpenClash and build
+        ln -sf /workdir/openwrtsdk "$GITHUB_WORKSPACE/openwrtsdk"
+
+    - name: Clone OpenClash source
       working-directory: /workdir/openwrtsdk
       run: |
-        df -hT $PWD
-
-        mkdir -p package/luci-app-openclash
-        cd package/luci-app-openclash
-
-        git init
-        git remote add -f origin $REPO_URL
-        git config core.sparsecheckout true
-        echo "luci-app-openclash" >> .git/info/sparse-checkout
-        git fetch --depth 1 origin $REPO_BRANCH
-        git checkout -b $REPO_BRANCH origin/$REPO_BRANCH
+        git clone --depth 1 -b "$REPO_BRANCH" --filter=blob:none --sparse "$REPO_URL" /workdir/OpenClash
+        cd /workdir/OpenClash
+        git sparse-checkout set luci-app-openclash
 
         cd /workdir/openwrtsdk
+        rm -rf package/luci-app-openclash
+        cp -r /workdir/OpenClash/luci-app-openclash package/luci-app-openclash
 
-        # 编译 po2lmo
-        pushd package/luci-app-openclash/luci-app-openclash/tools/po2lmo
-        make
-        sudo make install
-        popd
+        echo "OpenClash package files:"
+        ls -la package/luci-app-openclash
 
-        make package/luci-app-openclash/luci-app-openclash/compile V=s
+    - name: Build OpenClash APK
+      working-directory: /workdir/openwrtsdk
+      run: |
+        df -hT "$PWD"
 
-        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        export TERM=xterm
+
+        # 编译 po2lmo，避免 LuCI 翻译文件编译时报错
+        if [ -d package/luci-app-openclash/tools/po2lmo ]; then
+          make -C package/luci-app-openclash/tools/po2lmo
+          sudo make -C package/luci-app-openclash/tools/po2lmo install
+        fi
+
+        # GitHub Actions 没有交互终端，不能让 make 自动进 menuconfig
+        printf '%s\n' \
+          'CONFIG_PACKAGE_luci-app-openclash=m' \
+          > .config
+
+        make defconfig
+
+        echo "Check package config:"
+        grep "CONFIG_PACKAGE_luci-app-openclash" .config || true
+
+        make package/luci-app-openclash/compile V=s
+
+        echo "FIRMWARE=$PWD" >> "$GITHUB_ENV"
+
+    - name: Collect APK
+      working-directory: /workdir/openwrtsdk
+      run: |
+        mkdir -p /workdir/artifacts
+
+        echo "All generated APK files:"
+        find bin/packages -type f -name "*.apk" -print || true
+
+        echo "Collect OpenClash APK:"
+        find bin/packages -type f -name "luci-app-openclash*.apk" -exec cp -v {} /workdir/artifacts/ \;
+
+        echo "Artifacts:"
+        ls -lh /workdir/artifacts
+
+        if ! ls /workdir/artifacts/luci-app-openclash*.apk >/dev/null 2>&1; then
+          echo "ERROR: luci-app-openclash APK not found"
+          exit 1
+        fi
 
     - name: Create tag
       id: tag
       run: |
-        echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
-        echo "status=success" >> $GITHUB_OUTPUT
-
-        echo "Build output:"
-        find "${{ env.FIRMWARE }}/bin/packages" -name "luci-app-openclash*.apk" -print
+        echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> "$GITHUB_OUTPUT"
+        echo "status=success" >> "$GITHUB_OUTPUT"
 
     - name: Upload APK to release
       uses: softprops/action-gh-release@v2
@@ -92,4 +146,4 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         tag_name: ${{ steps.tag.outputs.release_tag }}
-        files: ${{ env.FIRMWARE }}/bin/packages/${{ env.OPENWRT_ARCH }}/base/luci-app-openclash*.apk
+        files: /workdir/artifacts/luci-app-openclash*.apk
